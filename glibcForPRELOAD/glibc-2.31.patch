@@ -1,0 +1,1282 @@
+diff -ruN glibc-2.31/gmon/gmon.c glibc-2.31_mod/gmon/gmon.c
+--- glibc-2.31/gmon/gmon.c	2023-01-29 18:03:19.388364595 -0500
++++ glibc-2.31_mod/gmon/gmon.c	2023-01-29 15:08:07.098793359 -0500
+@@ -31,6 +31,7 @@
+ #include <sys/gmon.h>
+ #include <sys/gmon_out.h>
+ #include <sys/uio.h>
++#include <sys/stat.h>
+ 
+ #include <errno.h>
+ #include <stdio.h>
+@@ -46,22 +47,28 @@
+ #include <libc-internal.h>
+ #include <not-cancel.h>
+ 
+-#ifdef PIC
+-# include <link.h>
++#define FILE_META "/tmp/vprof/info.txt"
++
++#define FILE_DEBUG "/tmp/vprof/gmon_debug.txt"
++#include <stdio.h>
++#ifdef FILE_DEBUG
++#define debug_print(fmt, ...) \
++  do { umask(002); FILE *dp = fopen(FILE_DEBUG, "a"); if (dp) {fprintf(dp, fmt, ## __VA_ARGS__); fclose(dp);} } while (0)
++#else
++#define debug_print(fmt, ...) \
++  do {} while(0)
++#endif
+ 
+-static int
+-callback (struct dl_phdr_info *info, size_t size, void *data)
++#ifdef PIC
++#include <link.h>
++static int callback (struct dl_phdr_info *info, size_t size, void *data)
+ {
+   if (info->dlpi_name[0] == '\0')
+-    {
+-      /* The link map for the executable is created by calling
+-	 _dl_new_object with "" as filename.  dl_iterate_phdr
+-	 calls the callback function with filename from the
+-	 link map as dlpi_name.  */
+-      u_long *load_address = data;
+-      *load_address = (u_long) info->dlpi_addr;
+-      return 1;
+-    }
++  {
++    u_long *load_address = data;
++    *load_address = (u_long) info->dlpi_addr;
++    return 1;
++  }
+ 
+   return 0;
+ }
+@@ -98,18 +105,23 @@
+   struct gmonparam *p = &_gmonparam;
+ 
+   /* Don't change the state if we ran into an error.  */
+-  if (p->state == GMON_PROF_ERROR)
++  if (p->state == GMON_PROF_ERROR) {
++    debug_print("prof error %d\n", __getpid());
+     return;
++  }
+ 
+   if (mode)
+     {
+       /* start */
++      debug_print("prof start %d\n", __getpid());
+       __profil((void *) p->kcount, p->kcountsize, p->lowpc, s_scale);
++      gmonparam_shadow = (void *)p; /*purpose of gmonparam_shadow: pass param to profil function as opaque structue*/
+       p->state = GMON_PROF_ON;
+     }
+   else
+     {
+       /* stop */
++      debug_print("prof stop %d\n", __getpid());
+       __profil(NULL, 0, 0, 0);
+       p->state = GMON_PROF_OFF;
+     }
+@@ -117,8 +129,228 @@
+ libc_hidden_def (__moncontrol)
+ weak_alias (__moncontrol, moncontrol)
+ 
++void sigUsr2Handler(int signo, siginfo_t *info, void *ctx)
++{
++  struct gmonparam *p = &_gmonparam;
++  if (p->state != GMON_PROF_ON) {
++    debug_print("profiler state %ld at pid %d\n", p->state,  __getpid());
++  } else {
++    debug_print("%d saving vprof result on SIGUSR2\n", __getpid());
++    _mcleanup();
++  }
++}
++/*
++#include <execinfo.h>
++void sigfault_handler(int signo, siginfo_t *info, void *ctx)
++{
++  void *array[10];
++  size_t size;
++  char **strings;
++  size_t i;
++
++  size = backtrace (array, 10);
++  strings = backtrace_symbols (array, size);
++  debug_print ("Obtained %zd stack frames.\n", size);
++  for (i = 0; i < size; i++)
++     debug_print("%s\n", strings[i]);
++  free (strings);
++  sigUsr2Handler(signo);
++}
++*/
+ 
+-void
++extern char *__progname;
++extern char *program_invocation_name;
++extern char *program_invocation_short_name;
++static char procname[512];
++
++static bool monitor_variables(const char *config_file)
++{
++  struct gmonparam *p = &_gmonparam;
++  u_long load_address = 0;
++#ifdef PIC
++  __dl_iterate_phdr (callback, &load_address);
++#endif
++  //handler for sig signal
++  struct sigaction signalact;
++  memset(&signalact, 0, sizeof(sigaction));
++  sigemptyset(&signalact.sa_mask);
++  signalact.sa_flags     = SA_SIGINFO;
++  signalact.sa_sigaction = sigUsr2Handler;
++  sigaction(SIGUSR2, &signalact, NULL);
++
++  /* Open the file for reading local variables need tracing*/
++  umask(002);
++  FILE *fp = fopen(config_file, "r");
++  if (!fp)
++    return false;
++  char buf[64];
++  __snprintf (buf, sizeof (buf), "/tmp/vprof/layout/layout.%u.out", __getpid());
++  FILE *fout = fopen(buf, "w");
++  if (!fout) {
++    fclose(fp);
++    debug_print("unable to open file %s\n", buf);
++    return false;
++  }
++
++  debug_print("Begin init monitor variables at %s(%u), hashfraction = %d, loadaddress = %lx, lowpc = %lx\n",
++      procname, __getpid(), HASHFRACTION, load_address, p->lowpc);
++
++  unsigned long long from, to;
++  unsigned short loc_atom;
++  long var_addr, size;
++  char *line = NULL;
++  size_t n = 0;
++  int callsite_index, prev_hash = 0;
++
++  while (getline(&line, &n, fp) != -1) {
++    if (line && line[0] == '#') {
++      fprintf(fout, "%s", line);
++      prev_hash = 0;
++      continue;
++    }
++    if (sscanf(line, "%llx:%llx:%hu:%ld:%ld\n", &from, &to, &loc_atom, &var_addr, &size) != 5 &&
++        sscanf(line, "%llx:%llx:%hu:%lx:%ld\n", &from, &to, &loc_atom, &var_addr, &size) != 5) {
++      debug_print("Invalid line: %s\n", line);
++      continue;
++    }
++    if (size == 0) { //meta data used to shadow the variable
++      callsite_index = pc2index(load_address + from, p);
++      if (callsite_index < 0 || (callsite_index + 1) * sizeof(*_gmonparam.froms) > p->fromssize) {
++        //debug_print("callsite index is out of range %d for 0x%llx\n", callsite_index, from);
++        continue;
++      }
++      ARCINDEX *callsite_index_ptr = &p->funcsites[callsite_index];
++      ARCINDEX shadowindex = ++p->shadows[0].link;
++      struct shadowstruct *top = &p->shadows[shadowindex];
++      top->func_enter = from;
++      top->trigger = to;
++      top->loc_atom = loc_atom;
++      top->addr = var_addr;
++      top->valid = 0;
++      top->link = *callsite_index_ptr;
++      *callsite_index_ptr = shadowindex;
++      debug_print("set shadow variable structure for %llx\n", from);
++      continue;
++    }
++    //place variable infomation to the hash map of variables
++    //a variable may take multiple entries in the hash map of callsites,
++    //and copies of entries in the hash map of variables in order to a fast reference
++    //from pc index.
++    for (unsigned long long i = from; i <= to;
++        i += _gmonparam.hashfraction * sizeof (*_gmonparam.froms)) {
++      //1. construct hash link with pc address from callsites hash map
++      callsite_index = pc2index(load_address + i, p);
++      if (callsite_index < 0 || (callsite_index + 1) * sizeof(*_gmonparam.froms) > p->fromssize) {
++        debug_print("callsite index is out of range %d at 0x%llx, from 0x%llx\n", callsite_index, i, from);
++        break;
++      }
++      //2. check if the top variable entry can be reused
++      ARCINDEX *callsite_index_ptr = &p->callsites[callsite_index];
++      if (prev_hash != 0
++          && p->variables[0].link < p->tolimit
++          && p->variables[p->variables[0].link].link == *callsite_index_ptr
++          && p->variables[p->variables[0].link].loc_atom == loc_atom
++          && p->variables[p->variables[0].link].addr == var_addr) {
++        *callsite_index_ptr = p->variables[0].link;
++      } else {
++        ARCINDEX varindex = ++p->variables[0].link;
++        if (varindex >= p->tolimit) {
++          debug_print("variables overflow at %d\n", __getpid());
++          goto out;
++        }
++        struct varstruct *top = &p->variables[varindex];
++        top->loc_atom = loc_atom;
++        top->addr = var_addr;
++        top->size = size;
++        top->link = *callsite_index_ptr;
++        top->lower_bound = from;
++        top->upper_bound = to;
++        *callsite_index_ptr = varindex;
++      }
++      prev_hash = callsite_index;
++      fprintf(fout, "pc=%llx,callsite_index=%d,var_index=%ld\n", i, callsite_index, *callsite_index_ptr);
++    }
++  }
++
++out:
++  debug_print("Finish init monitor variables at %s(%u), hashfraction = %d, loadaddress = %lx, lowpc = %lx\n",
++      __progname, __getpid(), HASHFRACTION, load_address, p->lowpc);
++  if (line)
++    free(line);
++  fclose(fp);
++  fclose(fout);
++  return true;
++}
++
++static void init_monitoring_vars(struct gmonparam *p)
++{
++  FILE *fp = fopen(FILE_META, "r");
++  if (!fp) {
++    return;
++  }
++  int progname_size = __progname == NULL? 0 : strlen(__progname);
++  if (__progname == NULL || progname_size == 0) {
++    int pid;
++    char filename[1000];
++    sprintf(filename, "/proc/%d/stat", __getpid());
++    FILE *f = fopen(filename, "r");
++    if (f) {
++      fscanf(f, "%d (%s)", &pid, procname);
++    }
++    fclose(f);
++    procname[strcspn(procname, ")")] = 0;
++    progname_size = strlen(procname);
++  } else {
++    memcpy(procname, __progname, progname_size + 1);
++  }
++
++  debug_print("init_monitoring_var for proc %s, pid = %u\n", procname, __getpid());
++  char *line = NULL;
++  size_t n = 0;
++  int nread = getline(&line, &n, fp);
++  fclose(fp);
++
++  if (nread == -1 || progname_size == 0) {
++    if (line)
++      free(line);
++    return;
++  }
++  line[strcspn(line, "\r\n")] = 0;
++  nread = strlen(line) - 1;
++
++  debug_print("read config %s[%d] in proc %s[%d] pid = %u\n", line + 1, nread, procname, progname_size, __getpid());
++  if (progname_size != nread || memcmp(line + 1, procname, nread) != 0) {
++    free(line);
++    return;
++  }
++  free(line);
++
++  debug_print("calloc sampling structures at %d\n", __getpid());
++
++  p->samplelimit = 2 * 1024 * 1024;
++  p->shadowlimit = 64;
++  char *cp = calloc (p->fromssize + p->tolimit * sizeof(struct varstruct)
++      +  p->samplelimit * sizeof(struct samplestruct) + p->fromssize + p->shadowlimit * sizeof(struct shadowstruct), 1);
++  if (!cp) {
++    ERR("monstartup: unable to allocate memory for monitoring variables\n");
++    p->variables = NULL;
++    p->samples = NULL;
++    return;
++  }
++  p->variables = (struct varstruct *)cp;
++  cp += p->tolimit * sizeof(struct varstruct);
++  p->samples = (struct samplestruct *)cp;
++  cp += p->samplelimit * sizeof(struct samplestruct);
++  p->callsites = (ARCINDEX *)cp;
++  cp += p->fromssize;
++  p->funcsites = (ARCINDEX *)cp;
++  cp +=p->fromssize;
++  p->shadows = (struct shadowstruct *)cp;
++
++  monitor_variables(FILE_META);
++}
++
++  void
+ __monstartup (u_long lowpc, u_long highpc)
+ {
+   int o;
+@@ -142,7 +374,8 @@
+ 	 instead of integer division.  Precompute shift amount. */
+       p->log_hashfraction = ffs(p->hashfraction * sizeof(*p->froms)) - 1;
+   }
+-  p->fromssize = p->textsize / HASHFRACTION;
++  //p->fromssize = p->textsize / HASHFRACTION;
++  p->fromssize = ROUNDUP(p->textsize / HASHFRACTION, sizeof(*p->froms));
+   p->tolimit = p->textsize * ARCDENSITY / 100;
+   if (p->tolimit < MINARCS)
+     p->tolimit = MINARCS;
+@@ -154,6 +387,7 @@
+   if (! cp)
+     {
+       ERR("monstartup: out of memory\n");
++      debug_print("monstartup: out of memory\n");
+       p->tos = NULL;
+       p->state = GMON_PROF_ERROR;
+       return;
+@@ -166,6 +400,8 @@
+ 
+   p->tos[0].link = 0;
+ 
++  init_monitoring_vars(p);
++
+   o = p->highpc - p->lowpc;
+   if (p->kcountsize < (u_long) o)
+     {
+@@ -367,15 +603,25 @@
+ 
+     if (fd == -1)
+       {
+-	fd = __open_nocancel ("gmon.out", O_CREAT|O_TRUNC|O_WRONLY|O_NOFOLLOW,
+-			      0666);
++        char buf[64];
++        __snprintf (buf, sizeof (buf), "/tmp/vprof/gmon/gmon.%u.out", __getpid ());
++        fd = __open_nocancel (buf, O_CREAT|O_TRUNC|O_WRONLY|O_NOFOLLOW,
++            0666);
++        char cwd[PATH_MAX] = "unknown cwd";
++        if (getcwd(cwd, PATH_MAX - 1) != NULL) {
++          //__fxprintf(NULL, "Current working dir: %s, write data to %s\n", cwd, buf);
++        } else {
++          perror("getcwd() error");
++        }
+ 	if (fd < 0)
+ 	  {
+ 	    char buf[300];
+ 	    int errnum = errno;
+-	    __fxprintf (NULL, "_mcleanup: gmon.out: %s\n",
+-			__strerror_r (errnum, buf, sizeof buf));
++	    __fxprintf (NULL, "check _mcleanup: gmon.out: %s in %s, %d\n",
++			__strerror_r (errnum, buf, sizeof buf), cwd, __getpid());
+ 	    return;
++	  } else {
++      //__fxprintf (NULL, "writing gmon for process %d (%s) in /tmp/vprof/gmon\n", __getpid(), __progname);
+ 	  }
+       }
+ 
+@@ -415,14 +661,119 @@
+     __close_nocancel_nostatus (fd);
+ }
+ 
++static void write_varsamples(void)
++{
++  if (_gmonparam.variables == NULL) {
++    debug_print("%s: [%d] variable buffer is NULL\n", __func__, __getpid());
++    return;
++  }
++
++  if (_gmonparam.samples[0].link == 0) {
++    debug_print("%s: [%d prof_state = %ld] sample size %ld\n", __func__, __getpid(), _gmonparam.state, _gmonparam.samples[0].link);
++    return;
++  }
++
++  int fd = -1;
++  char *env;
++
++  env = getenv ("GMON_VAR_PREFIX");
++  if (env != NULL && !__libc_enable_secure)
++  {
++    size_t len = strlen (env);
++    char buf[len + 20];
++    __snprintf (buf, sizeof (buf), "%s_var.%u", env, __getpid ());
++    fd = __open_nocancel (buf, O_CREAT|O_TRUNC|O_WRONLY|O_NOFOLLOW, 0666);
++  }
++
++  if (fd == -1)
++  {
++    char buf[64];
++    __snprintf (buf, sizeof (buf), "/tmp/vprof/gmon_var/gmon_var.%u.out", __getpid());
++    fd = __open_nocancel (buf, O_CREAT|O_TRUNC|O_WRONLY|O_NOFOLLOW,
++        0666);
++    char cwd[PATH_MAX] = "unknown cwd";
++    if (getcwd(cwd, PATH_MAX - 1) != NULL) {
++      //__fxprintf(NULL, "Current working dir: %s\n", cwd);
++    } else {
++      perror("getcwd() error");
++    }
++    if (fd < 0) {
++      char buf[300];
++      int errnum = errno;
++      __fxprintf (NULL, "check _mcleanup: gmon_var.out: %s in %s, %d\n",
++          __strerror_r (errnum, buf, sizeof buf), cwd, __getpid());
++      return;
++    } else {
++      //__fxprintf (NULL, "writing gmon variables for process %d (%s) in /tmp/vprof/gmon_var/\n", __getpid(), __progname);
++    }
++  }
++  /* Get load_address to profile PIE.  */
++  u_long load_address = 0;
++#ifdef PIC
++  __dl_iterate_phdr (callback, &load_address);
++#endif
++
++  if (_gmonparam.kcountsize > 0)
++  {
++    struct real_gmon_varsample_hdr
++    {
++      char *low_pc;
++      char *high_pc;
++      int32_t hist_size;
++      int32_t prof_rate;
++      char dimen[15];
++      char dimen_abbrev;
++      int32_t from_size;
++      int32_t var_limit;
++      int32_t sample_limit;
++      int32_t log_hashfraction;
++      int32_t scale;
++      int32_t sizeofhdr;
++      int32_t sizeofvar;
++      int32_t sizeofsample;
++    } thdr;
++
++    struct iovec iov[4] =
++    {
++      { &thdr, sizeof (struct real_gmon_varsample_hdr) },
++      { _gmonparam.callsites, _gmonparam.fromssize},
++      { _gmonparam.variables, _gmonparam.tolimit * sizeof(struct varstruct)},
++      { _gmonparam.samples, _gmonparam.samplelimit * sizeof(struct samplestruct) }
++    };
++    thdr.low_pc = (char *) _gmonparam.lowpc - load_address;
++    thdr.high_pc = (char *) _gmonparam.highpc - load_address;
++    thdr.hist_size = _gmonparam.kcountsize / sizeof (HISTCOUNTER);
++    thdr.prof_rate = __profile_frequency ();
++    strncpy (thdr.dimen, "seconds", sizeof (thdr.dimen));
++    thdr.dimen_abbrev = 's';
++    //infomaiton for decomplex arrays of structs
++    thdr.from_size = _gmonparam.fromssize;
++    thdr.var_limit = _gmonparam.tolimit;
++    thdr.sample_limit = _gmonparam.samplelimit;
++    thdr.log_hashfraction = _gmonparam.log_hashfraction;
++    thdr.scale = s_scale;
++    thdr.sizeofhdr = sizeof(thdr);
++    thdr.sizeofvar = sizeof(*_gmonparam.variables);
++    thdr.sizeofsample = sizeof(*_gmonparam.samples);
++
++    if (__progname != NULL)
++      debug_print("%ld [prof state = %ld] sample recoreded for %s, %u, %lu\n", _gmonparam.samples[0].link, _gmonparam.state, __progname, __getpid(), load_address);
++
++    __writev_nocancel_nostatus (fd, iov, 4);
++  }
++  __close_nocancel_nostatus (fd);
++}
+ 
+ void
+ __write_profiling (void)
+ {
++  debug_print("%s: [%d prof_state = %ld] sample size %ld\n", __func__, __getpid(), _gmonparam.state, _gmonparam.samples[0].link);
+   int save = _gmonparam.state;
+   _gmonparam.state = GMON_PROF_OFF;
+-  if (save == GMON_PROF_ON)
++  if (save == GMON_PROF_ON) {
+     write_gmon ();
++    write_varsamples();
++  }
+   _gmonparam.state = save;
+ }
+ #ifndef SHARED
+@@ -440,9 +791,17 @@
+ {
+   __moncontrol (0);
+ 
+-  if (_gmonparam.state != GMON_PROF_ERROR)
++  if (_gmonparam.state != GMON_PROF_ERROR) {
+     write_gmon ();
++    write_varsamples();
++  }
+ 
+   /* free the memory. */
+   free (_gmonparam.tos);
++  _gmonparam.tos = NULL;
++
++  if (_gmonparam.variables) {
++    free (_gmonparam.variables);
++    _gmonparam.variables = NULL;
++  }
+ }
+diff -ruN glibc-2.31/gmon/mcount.c glibc-2.31_mod/gmon/mcount.c
+--- glibc-2.31/gmon/mcount.c	2023-01-29 18:03:19.388364595 -0500
++++ glibc-2.31_mod/gmon/mcount.c	2023-01-29 17:41:49.925564236 -0500
+@@ -41,6 +41,11 @@
+ 
+ #include <atomic.h>
+ 
++#define FILE_DEBUG "/tmp/vprof/gmon_debug.txt"
++
++
++#include <stdio.h>
++
+ /*
+  * mcount is called on entry to each function compiled with the profiling
+  * switch set.  _mcount(), which is declared in a machine-dependent way
+diff -ruN glibc-2.31/gmon/sys/gmon.h glibc-2.31_mod/gmon/sys/gmon.h
+--- glibc-2.31/gmon/sys/gmon.h	2023-01-29 18:03:19.388364595 -0500
++++ glibc-2.31_mod/gmon/sys/gmon.h	2023-01-29 17:42:10.197725750 -0500
+@@ -135,6 +135,36 @@
+ 	ARCINDEX	link;
+ };
+ 
++struct varstruct {
++	unsigned short loc_atom;
++	long	addr;
++	long	size;
++	ARCINDEX	link;
++	ARCINDEX	sample_tail;
++  unsigned long lower_bound;
++  unsigned long upper_bound;
++};
++
++struct samplestruct{
++  unsigned long long seq_id;
++  unsigned short sampled;
++  unsigned long long val;
++  unsigned long long tid;
++  unsigned long var_pc;
++  unsigned long cur_pc;
++  ARCINDEX	link;
++};
++
++struct shadowstruct{
++  unsigned long func_enter;
++  unsigned long trigger;
++  unsigned short loc_atom;
++  long addr;
++  long long val;
++  unsigned short valid;
++  ARCINDEX link;
++};
++
+ /*
+  * a raw arc, with pointers to the calling site and
+  * the called site and a count.
+@@ -165,11 +195,32 @@
+ 	long		tolimit;
+ 	unsigned long	lowpc;
+ 	unsigned long	highpc;
+-	unsigned long	textsize;
+-	unsigned long	hashfraction;
+-	long		log_hashfraction;
++  unsigned long	textsize;
++  unsigned long	hashfraction;
++  long		log_hashfraction;
++  ARCINDEX	*callsites;
++  struct varstruct *variables;
++  struct samplestruct *samples;
++  unsigned long samplelimit;
++  ARCINDEX *funcsites;
++  struct shadowstruct *shadows;
++  unsigned long shadowlimit;
+ };
+ 
++#define UNWINDCALLER 1
++/* FIX_OUTRANGE_PC: If sampled pc is outside the text section,
++ * try to add sample back to the most recent caller
++ * in .text section within a max_depth unwind
++ */
++#define FIX_OUTRANGE_PC_GPROF 0
++
++/*
++ * sampled in sample struct is used to note the type of sample
++ */
++#define OUT_PC 0
++#define SELF_PC 1
++#define UNWIND_PC 2
++
+ /*
+  * Possible states of profiling.
+  */
+@@ -192,10 +243,20 @@
+ /* Set up data structures and start profiling.  */
+ extern void __monstartup (unsigned long __lowpc, unsigned long __highpc) __THROW;
+ extern void monstartup (unsigned long __lowpc, unsigned long __highpc) __THROW;
++extern int check_timer(void);
+ 
+ /* Clean up profiling and write out gmon.out.  */
+ extern void _mcleanup (void) __THROW;
+ 
++/* Define in sysdeps/posix/profil.c */
++extern void *gmonparam_shadow;
++extern u_long load_address;
++extern int pc2index(u_long selfpc, struct gmonparam *p);
++
++extern const unsigned short reg_table_size;
++extern unsigned short const x86_64_regstr_tbl[];
++extern long long readval(const void *, unsigned short, long, int, void*);
++
+ __END_DECLS
+ 
+ #endif /* sys/gmon.h */
+diff -ruN glibc-2.31/include/unistd.h glibc-2.31_mod/include/unistd.h
+--- glibc-2.31/include/unistd.h	2023-01-29 18:03:19.404364732 -0500
++++ glibc-2.31_mod/include/unistd.h	2023-01-29 15:08:07.566804291 -0500
+@@ -146,6 +146,8 @@
+ extern int __profil (unsigned short int *__sample_buffer, size_t __size,
+ 		     size_t __offset, unsigned int __scale)
+      attribute_hidden;
++//extern void *gmonparam_shadow;
++
+ extern int __getdtablesize (void) attribute_hidden;
+ extern int __brk (void *__addr) attribute_hidden;
+ extern int __close (int __fd);
+diff -ruN glibc-2.31/Makerules glibc-2.31_mod/Makerules
+--- glibc-2.31/Makerules	2023-01-29 18:03:19.364364390 -0500
++++ glibc-2.31_mod/Makerules	2023-01-29 15:08:11.486895706 -0500
+@@ -695,7 +695,8 @@
+ 			 $(elf-objpfx)sofini.os \
+ 			 $(elf-objpfx)interp.os \
+ 			 $(elf-objpfx)ld.so \
+-			 $(shlib-lds)
++			 $(shlib-lds) \
++       -lunwind
+ 	$(build-shlib)
+ 	$(call after-link,$@)
+ 
+@@ -704,7 +705,8 @@
+ 			 $(elf-objpfx)sofini.os \
+ 			 $(elf-objpfx)interp.os \
+ 			 $(elf-objpfx)ld.so \
+-			 $(shlib-lds)
++			 $(shlib-lds) \
++        -lunwind
+ 	$(build-shlib)
+ 	$(call after-link,$@)
+ 
+@@ -1013,11 +1015,15 @@
+ $(SHELL) $(..)scripts/rellns-sh $< $@.new
+ mv -f $@.new $@
+ endef
++#define make-link-multidir
++#$(patsubst %/,cd %,$(objpfx)); \
++#  $(addprefix $(abspath $(..)scripts/mkinstalldirs) ,$(dir $(multidir))); \
++#  $(LN_S) . $(multidir) 2> /dev/null; \
++#  test -L $(multidir)
++#endef
+ define make-link-multidir
+-$(patsubst %/,cd %,$(objpfx)); \
+-  $(addprefix $(abspath $(..)scripts/mkinstalldirs) ,$(dir $(multidir))); \
+-  $(LN_S) . $(multidir) 2> /dev/null; \
+-  test -L $(multidir)
++$(make-target-directory)
++ln -f $(objpfx)/$(@F) $@
+ endef
+ else
+ # If we have no symbolic links don't bother with rellns-sh.
+diff -ruN glibc-2.31/Rules glibc-2.31_mod/Rules
+--- glibc-2.31/Rules	2023-01-29 18:03:19.364364390 -0500
++++ glibc-2.31_mod/Rules	2023-01-29 15:08:11.474895427 -0500
+@@ -238,17 +238,17 @@
+ 	$(+link-pie)
+ endif
+ 
+-ifneq "$(strip $(binaries-static-notests))" ""
+-$(addprefix $(objpfx),$(binaries-static-notests)): %: %.o \
+-  $(sort $(filter $(common-objpfx)lib%,$(link-libc-static))) \
+-  $(addprefix $(csu-objpfx),start.o) $(+preinit) $(+postinit)
+-	$(+link-static)
+-endif
++#ifneq "$(strip $(binaries-static-notests))" ""
++#$(addprefix $(objpfx),$(binaries-static-notests)): %: %.o \
++#  $(sort $(filter $(common-objpfx)lib%,$(link-libc-static))) /usr/lib/x86_64-linux-gnu/libunwind.a \
++#  $(addprefix $(csu-objpfx),start.o) $(+preinit) $(+postinit)
++#	$(+link-static) /usr/lib/x86_64-linux-gnu/libunwind.a
++#endif
+ 
+ ifneq "$(strip $(binaries-static-tests))" ""
+ $(addprefix $(objpfx),$(binaries-static-tests)): %: %.o \
+   $(link-extra-libs-tests) \
+-  $(sort $(filter $(common-objpfx)lib%,$(link-libc-static-tests))) \
++  $(sort $(filter $(common-objpfx)lib%,$(link-libc-static-tests))) /usr/lib/x86_64-linux-gnu/libunwind.a\
+   $(addprefix $(csu-objpfx),start.o) $(+preinit) $(+postinit)
+ 	$(+link-static-tests)
+ endif
+diff -ruN glibc-2.31/stdlib/atexit.c glibc-2.31_mod/stdlib/atexit.c
+--- glibc-2.31/stdlib/atexit.c	2023-01-29 18:03:19.504365585 -0500
++++ glibc-2.31_mod/stdlib/atexit.c	2023-01-29 15:08:09.458848450 -0500
+@@ -37,6 +37,7 @@
+ #include "exit.h"
+ 
+ /* Register FUNC to be executed by `exit'.  */
++//void*   __dso_handle = (void*) &__dso_handle;
+ int
+ #ifndef atexit
+ attribute_hidden
+diff -ruN glibc-2.31/sysdeps/posix/profil.c glibc-2.31_mod/sysdeps/posix/profil.c
+--- glibc-2.31/sysdeps/posix/profil.c	2023-01-29 18:03:19.552365995 -0500
++++ glibc-2.31_mod/sysdeps/posix/profil.c	2023-01-29 18:02:27.031919658 -0500
+@@ -24,6 +24,39 @@
+ #include <stdint.h>
+ #include <libc-internal.h>
+ #include <sigsetops.h>
++#include <time.h>
++
++void *gmonparam_shadow = NULL;
++u_long load_address = 0;
++#include <sys/gmon.h>
++
++#ifdef PIC
++#include <link.h>
++int callback (struct dl_phdr_info *info, size_t size, void *data)
++{
++  if (info->dlpi_name[0] == '\0')
++  {
++    u_long *load_address = data;
++    *load_address = (u_long) info->dlpi_addr;
++    return 1;
++  }
++
++  return 0;
++}
++#endif
++
++#define HASHFRACTION 2
++int pc2index(uintptr_t selfpc, struct gmonparam *p) {
++  int j = -1;
++  if ((HASHFRACTION & (HASHFRACTION - 1)) == 0) {
++    j = (selfpc - p->lowpc) >> p->log_hashfraction;
++  } else {
++    j = (selfpc - p->lowpc) / (p->hashfraction * sizeof(*p->callsites));
++  }
++  if (selfpc - p->lowpc <= p->textsize)
++    return j;
++  return -1;
++}
+ 
+ #ifndef SIGPROF
+ 
+@@ -36,8 +69,361 @@
+ static size_t pc_offset;
+ static u_int pc_scale;
+ 
++
++#include "../generic/dwarf2.h"
++const unsigned short reg_table_size = 16;
++unsigned short const x86_64_regstr_tbl[] = {
++  REG_RAX, REG_RDX, REG_RCX, REG_RBX, REG_RSI, REG_RDI,
++  REG_RBP, REG_RSP, REG_R8, REG_R9, REG_R10, REG_R11,
++  REG_R12, REG_R13, REG_R14, REG_R15, REG_RIP
++};
++static bool reg_valid[17] = {true};
++
++long long readval(const void* bctx, unsigned short loc_atom, long addr, int size, void *b_read) {
++  const ucontext_t *ctx = (const ucontext_t *)(bctx);
++  bool *read = (bool *)b_read;
++  long long val = 0xdeadbeef;
++  switch(loc_atom) {
++    case DW_OP_lit0:
++    case DW_OP_lit1:
++    case DW_OP_lit2:
++    case DW_OP_lit3:
++    case DW_OP_lit4:
++    case DW_OP_lit5:
++    case DW_OP_lit6:
++    case DW_OP_lit7:
++    case DW_OP_lit8:
++    case DW_OP_lit9:
++    case DW_OP_lit10:
++    case DW_OP_lit11:
++    case DW_OP_lit12:
++    case DW_OP_lit13:
++    case DW_OP_lit14:
++    case DW_OP_lit15:
++    case DW_OP_lit16:
++    case DW_OP_lit17:
++    case DW_OP_lit18:
++    case DW_OP_lit19:
++    case DW_OP_lit20:
++    case DW_OP_lit21:
++    case DW_OP_lit22:
++    case DW_OP_lit23:
++    case DW_OP_lit24:
++    case DW_OP_lit25:
++    case DW_OP_lit26:
++    case DW_OP_lit27:
++    case DW_OP_lit28:
++    case DW_OP_lit29:
++    case DW_OP_lit30:
++    case DW_OP_lit31: {
++                        val = (long long)(loc_atom - DW_OP_lit0);
++                        *read = true;
++                        break;
++                      }
++    case DW_OP_const1u:
++    case DW_OP_const1s:
++    case DW_OP_const2u:
++    case DW_OP_const2s:
++    case DW_OP_const4u:
++    case DW_OP_const4s:
++    case DW_OP_const8u:
++    case DW_OP_const8s:
++    case DW_OP_constu:
++    case DW_OP_consts: {
++                         val = (long long)addr;
++                        *read = true;
++                         break;
++                       }
++    case DW_OP_reg0:
++    case DW_OP_reg1:
++    case DW_OP_reg2:
++    case DW_OP_reg3:
++    case DW_OP_reg4:
++    case DW_OP_reg5:
++    case DW_OP_reg6:
++    case DW_OP_reg7:
++    case DW_OP_reg8:
++    case DW_OP_reg9:
++    case DW_OP_reg10:
++    case DW_OP_reg11:
++    case DW_OP_reg12:
++    case DW_OP_reg13:
++    case DW_OP_reg14:
++    case DW_OP_reg15:
++    case DW_OP_reg16:
++    case DW_OP_reg17:
++    case DW_OP_reg18:
++    case DW_OP_reg19:
++    case DW_OP_reg20:
++    case DW_OP_reg21:
++    case DW_OP_reg22:
++    case DW_OP_reg23:
++    case DW_OP_reg24:
++    case DW_OP_reg25:
++    case DW_OP_reg26:
++    case DW_OP_reg27:
++    case DW_OP_reg28:
++    case DW_OP_reg29:
++    case DW_OP_reg30:
++    case DW_OP_reg31: {
++                        //0x50 - 0x6f: register
++                        unsigned short reg_id  = loc_atom - DW_OP_reg0;
++                        if (reg_id < reg_table_size) {
++                          val = (long long)(ctx->uc_mcontext.gregs[x86_64_regstr_tbl[reg_id]]);
++                          *read = true;
++                        }
++                        break;
++                      }
++    case DW_OP_breg0:
++    case DW_OP_breg1:
++    case DW_OP_breg2:
++    case DW_OP_breg3:
++    case DW_OP_breg4:
++    case DW_OP_breg5:
++    case DW_OP_breg6:
++    case DW_OP_breg7:
++    case DW_OP_breg8:
++    case DW_OP_breg9:
++    case DW_OP_breg10:
++    case DW_OP_breg11:
++    case DW_OP_breg12:
++    case DW_OP_breg13:
++    case DW_OP_breg14:
++    case DW_OP_breg15:
++    case DW_OP_breg16:
++    case DW_OP_breg17:
++    case DW_OP_breg18:
++    case DW_OP_breg19:
++    case DW_OP_breg20:
++    case DW_OP_breg21:
++    case DW_OP_breg22:
++    case DW_OP_breg23:
++    case DW_OP_breg24:
++    case DW_OP_breg25:
++    case DW_OP_breg26:
++    case DW_OP_breg27:
++    case DW_OP_breg28:
++    case DW_OP_breg29:
++    case DW_OP_breg30:
++    case DW_OP_breg31: {
++                         //0x70 - 0x8f
++                         unsigned short reg_id  = loc_atom - DW_OP_breg0;
++                         if (reg_id < reg_table_size && reg_valid[reg_id] == true) {
++                           long long *valptr = (long long *)(ctx->uc_mcontext.gregs[x86_64_regstr_tbl[reg_id]] + addr);
++                           if (valptr != NULL && (u_long)valptr >= ctx->uc_mcontext.gregs[REG_RSP]) {
++                             val = 0;
++                             memcpy((void*)(&val), valptr, size);
++                             *read = true;
++                           }
++                         }
++                         break;
++                       }
++
++    case DW_OP_fbreg: {
++                        long long* valptr = (long long *)(ctx->uc_mcontext.gregs[REG_RBP]
++                            + 16 + addr);
++                        if (valptr != NULL) {
++                          val = 0;
++                          memcpy((void*)(&val), valptr, size);
++                          *read = true;
++                        }
++                        break;
++                      }
++
++    case DW_OP_addr: {
++                       long long *valptr = (long long *)(addr + load_address);
++                       if (valptr != NULL) {
++                         val = 0;
++                         memcpy((void*)(&val), valptr, size);
++                         *read = true;
++                       }
++                       break;
++                     }
++
++    default:
++                     val = 0xdeadbeef;
++  }
++  return val;
++}
++
++static void
++sample_variables(struct gmonparam *p, const ucontext_t *ctx, long long timestamp,
++    unsigned short sampled, u_long callee_pc) {
++
++  u_long pc = ctx->uc_mcontext.gregs[REG_RIP] - load_address;
++  int callsite_index = pc2index(ctx->uc_mcontext.gregs[REG_RIP], p);
++
++  if (sampled >= UNWIND_PC) {
++    pc = pc - 6; //adjust pc to the instruction before call
++    callsite_index = pc2index(ctx->uc_mcontext.gregs[REG_RIP] - 6, p);
++  } else {
++    memset(reg_valid, true, reg_table_size * sizeof(bool));
++  }
++  
++  int index = p->callsites[callsite_index];
++  if (callsite_index < 0 
++        || callsite_index >= p->fromssize / sizeof(ARCINDEX)
++        || index == 0)
++      return;
++
++  while (index > 0 && index < p->tolimit) {
++    if (pc < p->variables[index].lower_bound ||
++        pc > p->variables[index].upper_bound) {
++      goto next_var;
++    }
++
++    int size = p->variables[index].size;
++    size = size >= 0 ? size : sizeof(void *);
++    if (size > 8 || size == 0)
++      goto next_var;
++
++    bool read = false;
++    long long val = readval(ctx, p->variables[index].loc_atom, p->variables[index].addr, size, &read);
++
++    if (!read)
++      goto next_var;
++
++    //dereference if size is negative in config
++    if (p->variables[index].size < 0) {
++      if (val == 0) {
++        val = 0xdeadcafe;
++      } else {
++        void *src = (void *)val;
++        int size = (-p->variables[index].size) % 8;
++        size = size == 0 ? 8 : size;
++        val = 0;
++        memcpy(&val, src, -p->variables[index].size);
++      }
++    }
++    // store a new sample instance
++    ARCINDEX* tail = &(p->variables[index].sample_tail);
++    ARCINDEX val_index = ++p->samples[0].link;
++    if (val_index >= p->samplelimit) {
++      return;
++    }
++    struct samplestruct *top = &p->samples[val_index];
++    top->seq_id = timestamp;
++    top->sampled = sampled;
++    top->val = val;
++    top->tid = gettid();
++    top->link = *tail;
++    top->var_pc = pc;//ctx->uc_mcontext.gregs[REG_RIP] - 6;
++    top->cur_pc = callee_pc;
++    *tail = val_index;
++
++next_var:
++    //process the next variable instrumented for the same pc
++    index = p->variables[index].link;
++  }
++}
++#if UNWINDCALLER
++#if IS_IN (libc)
++#define UNW_LOCAL_ONLY
++#include <libunwind.h>
++static int store_context(ucontext_t *dest, unw_cursor_t *cursor)
++{
++  //save register values from cursor
++  int ret = 0;
++  unw_word_t reg;
++  for (int i = 0; i < reg_table_size; ++i) {
++    unsigned short id = x86_64_regstr_tbl[i];
++    ret = unw_get_reg(cursor, i, &reg);
++    if (ret == UNW_ESUCCESS) {
++        dest->uc_mcontext.gregs[id] = (long long int)reg;
++        reg_valid[i] = true;
++    } else {
++        reg_valid[i] = false;
++    }
++  }
++  //update rip
++  ret = unw_get_reg(cursor, UNW_REG_IP, &reg);
++  dest->uc_mcontext.gregs[x86_64_regstr_tbl[reg_table_size]] = reg;
++  return ret;
++}
++#if FIX_OUTRANGE_PC_GPROF
++static int sample_record(size_t pc) {
++  size_t i = (pc - pc_offset) / 2;
++  if (sizeof (unsigned long long int) > sizeof (size_t))
++    i = (unsigned long long int) i * pc_scale / 65536;
++  else
++    i = i / 65536 * pc_scale + i % 65536 * pc_scale / 65536;
++  return i;
++}
++#endif
++
++static void unwind_sample(struct gmonparam *p, const ucontext_t *ctx,
++  long long timestamp, const int max_depth) {
++  
++  //save current context
++  ucontext_t prev_ctx;
++  memcpy(&prev_ctx, ctx, sizeof(ucontext_t));
++  
++  //init unwind context
++  unw_context_t context;
++  unw_cursor_t cursor;
++  unw_getcontext(&context);
++  unw_init_local(&cursor, &context);
++
++  //skip current frame, sample frame (profil_count), signal handler frame and callee frame in ctx.
++  unw_word_t ip;
++  while (unw_step(&cursor) > 0) {
++    store_context(&prev_ctx, &cursor);
++    unw_get_reg(&cursor, UNW_REG_IP, &ip);
++    if (ip == ctx->uc_mcontext.gregs[REG_RIP])  //callee ip
++      break;
++  }
++  if (ip != ctx->uc_mcontext.gregs[REG_RIP] || unw_step(&cursor) <= 0)
++    return;
++#if FIX_OUTRANGE_PC_GPROF
++  int sample_index = sample_record(ip);
++#endif
++  //get previous max_depth and sample variables with context
++  for (int i = 0; i < max_depth; ++i) {
++    store_context(&prev_ctx, &cursor);
++    sample_variables(p, &prev_ctx, timestamp, UNWIND_PC + i, ip - load_address);
++#if FIX_OUTRANGE_PC_GPROF
++    if (sample_index >= nsamples) {
++      sample_index = sample_record(prev_ctx.uc_mcontext.gregs[REG_RIP]);
++      if (sample_index < nsamples)
++        ++samples[sample_index];
++    }
++#endif
++    if (unw_step(&cursor) <= 0)
++      break;
++  }
++}
++#else
++static void unwind_sample(struct gmonparam *p, const ucontext_t *ctx,
++  long long timestamp, const int max_depth) {
++}
++#endif
++#endif
++
++static int launch_pid = 0;
++static bool set_itimer = false;
++int check_timer(void)
++{
++  if (set_itimer == true || __getpid() == launch_pid) {
++    return 0;
++  }
++#ifdef PIC
++  __dl_iterate_phdr (callback, &load_address);
++#endif
++  struct itimerval timer;
++  static struct itimerval otimer;
++  timer.it_value.tv_sec = 0;
++  timer.it_value.tv_usec = 1000000 / __profile_frequency ();
++  timer.it_interval = timer.it_value;
++  int ret = __setitimer (ITIMER_PROF, &timer, &otimer);
++  if (timer.it_interval.tv_sec != otimer.it_interval.tv_sec
++      || timer.it_interval.tv_usec != otimer.it_interval.tv_usec) {
++    set_itimer = true;
++  }
++  return ret;
++}
++
+ static inline void
+-profil_count (uintptr_t pc)
++profil_count (uintptr_t pc, const void *ctx, uintptr_t fp)
+ {
+   size_t i = (pc - pc_offset) / 2;
+ 
+@@ -48,8 +434,32 @@
+ 
+   if (i < nsamples)
+     ++samples[i];
++
++  check_timer();
++
++  if (gmonparam_shadow == NULL)
++	  return;
++  struct timeval tv;
++  gettimeofday(&tv, NULL);
++  struct gmonparam *p = (struct gmonparam *)gmonparam_shadow;
++  if (p->variables == NULL 
++      || p->samples[0].link < 0
++      || p->samples[0].link >= p->samplelimit)
++	  return;
++  
++  sample_variables(p, (const ucontext_t *)ctx, 
++      tv.tv_sec * 1000000 + tv.tv_usec, i < nsamples ? 1 : 0, pc - load_address);
++  
++#if UNWINDCALLER
++  //even though current pc is not within the monitored range
++  //we still check its callers. 
++  //libunwind to sample caller variables
++  const int depth = 3;
++  unwind_sample(p, (const ucontext_t *)ctx, tv.tv_sec * 1000000 + tv.tv_usec, depth);
++#endif
+ }
+ 
++
+ /* Get the machine-dependent definition of `__profil_counter', the signal
+    handler for SIGPROF.  It calls `profil_count' (above) with the PC of the
+    interrupted code.  */
+@@ -73,26 +483,29 @@
+ # define otimer_ptr &otimer
+ 
+   if (sample_buffer == NULL)
+-    {
+-      /* Disable profiling.  */
+-      if (samples == NULL)
+-	/* Wasn't turned on.  */
+-	return 0;
+-
+-      if (__setitimer (ITIMER_PROF, &otimer, NULL) < 0)
+-	return -1;
+-      samples = NULL;
+-      return __sigaction (SIGPROF, &oact, NULL);
+-    }
+-
+- if (samples)
+-    {
+-      /* Was already turned on.  Restore old timer and signal handler
+-	 first.  */
+-      if (__setitimer (ITIMER_PROF, &otimer, NULL) < 0
+-	  || __sigaction (SIGPROF, &oact, NULL) < 0)
+-	return -1;
++  {
++    /* Disable profiling.  */
++    if (samples == NULL) {
++      /* Wasn't turned on.  */
++      return 0;
++    }
++
++    if (__setitimer (ITIMER_PROF, &otimer, NULL) < 0) {
++      return -1;
+     }
++    samples = NULL;
++    return __sigaction (SIGPROF, &oact, NULL);
++  }
++
++  if (samples)
++  {
++    /* Was already turned on.  Restore old timer and signal handler
++       first.  */
++    if (__setitimer (ITIMER_PROF, &otimer, NULL) < 0
++        || __sigaction (SIGPROF, &oact, NULL) < 0) {
++      return -1;
++    }
++  }
+ #else
+  /* In ld.so profiling should never be disabled once it runs.  */
+  //assert (sample_buffer != NULL);
+@@ -114,9 +527,15 @@
+ #endif
+   act.sa_flags |= SA_RESTART;
+   __sigfillset (&act.sa_mask);
+-  if (__sigaction (SIGPROF, &act, oact_ptr) < 0)
++  if (__sigaction (SIGPROF, &act, oact_ptr) < 0) {
+     return -1;
++  }
++
++#ifdef PIC
++  __dl_iterate_phdr (callback, &load_address);
++#endif
+ 
++  launch_pid = __getpid();
+   timer.it_value.tv_sec = 0;
+   timer.it_value.tv_usec = 1000000 / __profile_frequency ();
+   timer.it_interval = timer.it_value;
+diff -ruN glibc-2.31/sysdeps/posix/sprofil.c glibc-2.31_mod/sysdeps/posix/sprofil.c
+--- glibc-2.31/sysdeps/posix/sprofil.c	2023-01-29 18:03:19.552365995 -0500
++++ glibc-2.31_mod/sysdeps/posix/sprofil.c	2023-01-29 15:08:10.298868033 -0500
+@@ -180,14 +180,16 @@
+    handler for SIGPROF.  It calls `profil_count' (above) with the PC of the
+    interrupted code.  */
+ #define __profil_counter	__profil_counter_ushort
+-#define profil_count(pc)	profil_count (pc, 0)
++//#define profil_count(pc)	profil_count (pc, 0)
++#define profil_count(pc, ctx, fp)	profil_count (pc, 0)
+ #include <profil-counter.h>
+ 
+ #undef __profil_counter
+ #undef profil_count
+ 
+ #define __profil_counter	__profil_counter_uint
+-#define profil_count(pc)	profil_count (pc, 1)
++//#define profil_count(pc)	profil_count (pc, 1)
++#define profil_count(pc, ctx, fp)	profil_count (pc, 1)
+ #include <profil-counter.h>
+ 
+ static int
+diff -ruN glibc-2.31/sysdeps/unix/sysv/linux/prof-freq.c glibc-2.31_mod/sysdeps/unix/sysv/linux/prof-freq.c
+--- glibc-2.31/sysdeps/unix/sysv/linux/prof-freq.c	2023-01-29 18:03:19.584366268 -0500
++++ glibc-2.31_mod/sysdeps/unix/sysv/linux/prof-freq.c	2023-01-29 15:08:11.098886672 -0500
+@@ -24,6 +24,7 @@
+ int
+ __profile_frequency (void)
+ {
+-  return GLRO(dl_clktck);
++  return 2 * GLRO(dl_clktck);
++  //return GLRO(dl_clktck);
+ }
+ libc_hidden_def (__profile_frequency)
+diff -ruN glibc-2.31/sysdeps/unix/sysv/linux/profil-counter.h glibc-2.31_mod/sysdeps/unix/sysv/linux/profil-counter.h
+--- glibc-2.31/sysdeps/unix/sysv/linux/profil-counter.h	2023-01-29 18:03:19.584366268 -0500
++++ glibc-2.31_mod/sysdeps/unix/sysv/linux/profil-counter.h	2023-01-29 15:08:11.098886672 -0500
+@@ -23,7 +23,8 @@
+ static void
+ __profil_counter (int signo, siginfo_t *info, void *ctx)
+ {
+-  profil_count (sigcontext_get_pc (ctx));
++  //profil_count (sigcontext_get_pc (ctx));
++  profil_count (sigcontext_get_pc (ctx), ctx, sigcontext_get_fp (ctx));
+ 
+   /* This is a hack to prevent the compiler from implementing the
+      above function call as a sibcall.  The sibcall would overwrite
+diff -ruN glibc-2.31/sysdeps/unix/sysv/linux/x86_64/sigcontextinfo.h glibc-2.31_mod/sysdeps/unix/sysv/linux/x86_64/sigcontextinfo.h
+--- glibc-2.31/sysdeps/unix/sysv/linux/x86_64/sigcontextinfo.h	2023-01-29 18:03:19.596366371 -0500
++++ glibc-2.31_mod/sysdeps/unix/sysv/linux/x86_64/sigcontextinfo.h	2023-01-29 15:08:11.098886672 -0500
+@@ -23,5 +23,15 @@
+ {
+   return ctx->uc_mcontext.gregs[REG_RIP];
+ }
++static inline uintptr_t
++sigcontext_get_sp (const ucontext_t *ctx)
++{
++  return ctx->uc_mcontext.gregs[REG_RSP];
++}
++static inline uintptr_t
++sigcontext_get_fp (const ucontext_t *ctx)
++{
++  return ctx->uc_mcontext.gregs[REG_RBP];
++}
+ 
+ #endif
