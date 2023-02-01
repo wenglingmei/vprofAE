@@ -5,6 +5,8 @@
 install llvm-project
 
 install libunwind
+
+install pytelftools
 ```
 2.create a soft link from llvm-project/build to /usr/local/opt/llvm
 ```
