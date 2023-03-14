@@ -1,4 +1,4 @@
-#Effective Performance Issue Diagnosis with Value-Assisted Cost Profiling
+# Effective Performance Issue Diagnosis with Value-Assisted Cost Profiling
 
 Diagnosing performance issues is often difficult, especially when they
 occur only during some program executions.
