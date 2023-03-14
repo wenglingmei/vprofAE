@@ -19,18 +19,35 @@ issues while other state-of-the-art tools diagnose only a few
 of them.  We further use vprof to diagnose longstanding performance
 issues in these applications that have been unresolved for over
 four years.
-
-## Install software dependencies
+## Download the directory
 ```
+git clone git@github.com:wenglingmei/vprofAE.git
+```
+## Install software dependencies
+
 install llvm-project
-
+```
+$ git clone https://github.com/llvm/llvm-project.git
+$ cd llvm-project
+$ cmake -S llvm -B build -G "Unix Makefiles" -DLLVM_ENABLE_PROJECTS="clang;lld" -DCMAKE_BUILD_TYPE=Release
+$ cmake --build .
+```
 install libunwind
-
+```
+$ git clone https://github.com/libunwind/libunwind.git
+$ cd libunwind
+$ autoreconf -i
+$ ./configure
+$ make
+$ make install
+```
 install pytelftools
+```
+$ pip install pyelftools
 ```
 ## Create a soft link from llvm-project/build to /usr/local/opt/llvm
 ```
-$ln -s llvm-project/build /usr/local/opt/llvm
+$ ln -s llvm-project/build /usr/local/opt/llvm
 ```
 ## Setup vprof
 ```
