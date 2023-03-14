@@ -1,6 +1,26 @@
-# vprofAE
+#Effective Performance Issue Diagnosis with Value-Assisted Cost Profiling
 
-1. install software dependencies
+Diagnosing performance issues is often difficult, especially when they
+occur only during some program executions.
+Profilers can help with performance debugging, but are ineffective
+when the most costly functions are not the root causes of performance
+issues.  To address this problem, we
+introduce a new profiling methodology,
+**value-assisted cost profiling**, and a tool vprof.
+Our insight is that capturing the values of variables can
+greatly help diagnose performance issues.
+vprof continuously records values while profiling normal and buggy
+program executions.  It identifies anomalies in the values and
+the functions where they occur to pinpoint the real root causes of
+performance issues.
+Using a set of 15 real-world performance bugs in four widely-used
+applications, we show that vprof is effective at diagnosing all of the
+issues while other state-of-the-art tools diagnose only a few
+of them.  We further use vprof to diagnose longstanding performance
+issues in these applications that have been unresolved for over
+four years.
+
+## Install software dependencies
 ```
 install llvm-project
 
@@ -8,16 +28,18 @@ install libunwind
 
 install pytelftools
 ```
-2.create a soft link from llvm-project/build to /usr/local/opt/llvm
+## Create a soft link from llvm-project/build to /usr/local/opt/llvm
 ```
 $ln -s llvm-project/build /usr/local/opt/llvm
 ```
-3.setup vprof
+## Setup vprof
 ```
 $./prepare.sh
 ```
-4.run testcase.
+## run testcase.
 ```
 $ cd redis-8145
 $./test.sh
 ```
+
+
