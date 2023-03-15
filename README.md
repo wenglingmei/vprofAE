@@ -13,12 +13,7 @@ vprof continuously records values while profiling normal and buggy
 program executions.  It identifies anomalies in the values and
 the functions where they occur to pinpoint the real root causes of
 performance issues.
-Using a set of 15 real-world performance bugs in four widely-used
-applications, we show that vprof is effective at diagnosing all of the
-issues while other state-of-the-art tools diagnose only a few
-of them.  We further use vprof to diagnose longstanding performance
-issues in these applications that have been unresolved for over
-four years.
+
 ## Download the directory
 ```
 git clone git@github.com:wenglingmei/vprofAE.git
@@ -53,10 +48,10 @@ $ ln -s llvm-project/build /usr/local/opt/llvm
 ```
 $./prepare.sh
 ```
-## run testcase.
+## Run testcase.
 ```
 $ cd redis-8145
 $./test.sh
 ```
-## reference
+# Reference
 Effective Performance Issue Diagnosis with Value-Assisted Cost Profiling (Eurosys'23)
