@@ -3,8 +3,10 @@ In this test case, we need to generate a cluster on Redis server.
 We provide two test scripts:
 19-cluster-node-slots.bug.tcl is for buggy run and 19-cluster-node-slots.norm.tcl is for the baseline.
 The main difference between them is on the number of the nodes.
-In the evaluation, the node number is set to 400, which can fail the test sometimes for some
+
+In our evaluation, the node number is 80 for the baseline and 400 for the buggy run, which can fail the test sometimes for some
 unknown reason. What we can do is to repeat the buggy run.
+
 In this directory, we set a 40-nodes cluster for the buggy run and a 20-nodes cluster for the baseline,
 to provide a smooth testing.
 
