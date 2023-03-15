@@ -1,4 +1,4 @@
-#Testing redis-8145
+# Testing redis-8145
 In this test case, we need to generate a cluster on Redis server.
 We provide two test scripts:
 19-cluster-node-slots.bug.tcl is for buggy run and 19-cluster-node-slots.norm.tcl is for the baseline.
@@ -8,16 +8,16 @@ unknown reason. What we can do is to repeat the bug run.
 In this directory, we set a 40-nodes cluster for the buggy run and a 20-nodes cluster for the baseline,
 to provide a smooth testing.
 
-##The one click run
+## The one click run
 ```
 $ ./test.sh
 ```
-##If the 40-node cluster still fails in your test, try to repeat the buggy case:
+## If the 40-node cluster still fails in your test, try to repeat the buggy case:
 ```
 $ ./run_bug.sh
 ```
 
-##Post-Profiling analysis can be run with the script:
+## Post-Profiling analysis can be run with the script:
 ```
 $./analyze.sh
 ```
