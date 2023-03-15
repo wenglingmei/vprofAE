@@ -17,6 +17,7 @@ from scipy.spatial.distance import euclidean
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Pool
 import warnings
+import random
 warnings.filterwarnings("ignore")
 
 from static_analyzer import key_desc, regx_desc, func_index, symbol_index
@@ -34,9 +35,10 @@ class VarDiscountCalculator():
     in distribution.
     """
     sample_duration = 5 #ms
-    def __init__(self, norm_vars, bug_vars):
-        self.norms = norm_vars.samples
-        self.bugs = bug_vars.samples
+    def __init__(self, norm_vars, bug_vars, index):
+        norm_index = random.randrange(len(norm_vars.samples))
+        self.norms = norm_vars.samples[norm_index:norm_index + 1]
+        self.bugs = bug_vars.samples[index:index + 1]
         self.bug_schemas = bug_vars.schemas
         self.norm_schemas = norm_vars.schemas
         self.schemas = [key for key in self.bug_schemas if key in self.norm_schemas]
@@ -421,7 +423,7 @@ if __name__ == '__main__':
         sample.display_samples("var_samples.norms.txt")
     for sample in bug_vars.samples:
         sample.display_samples("var_samples.bugs.txt")
-    discount_calculator = VarDiscountCalculator(norm_vars, bug_vars)
+    discount_calculator = VarDiscountCalculator(norm_vars, bug_vars, 0)
     discount_calculator.aggregate_discount_for_varsample(bug_vars.samples[0])
 
     def unfold_descs_for_func():

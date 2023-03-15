@@ -213,7 +213,16 @@ class VarSample:
                 sample = self.samples[sample_index]
                 samples_array.append(sample)
         samples_array.sort(key=lambda x:x.seqid)
-        return samples_array
+        dedup_array = []
+        prev = None
+        for sample in samples_array:
+            if prev == None:
+                dedup_array.append(sample)
+                prev = sample
+            elif sample.seqid != prev.seqid:
+                    dedup_array.append(sample)
+                    prev = sample
+        return dedup_array
 
     def print_sample(self, sample):
         text = '    timestamp = {s_id}, type = {stype}, val = 0x{val:x}, pc = 0x{pc:x}, tid = 0x{tid:x}, file = {filename}, line = {line}\n'

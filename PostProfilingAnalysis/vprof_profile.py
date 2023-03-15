@@ -32,7 +32,7 @@ class DiscountAttributer:
         self.cost_calculator.set_valid_discount(valid_discount)
         self.cost_discounts = self.cost_calculator.aggregate_discount()
 
-        self.var_calculator = VarDiscountCalculator(norm_vars, bug_vars)
+        self.var_calculator = VarDiscountCalculator(norm_vars, bug_vars, index)
         self.var_calculator.set_valid_discount(valid_discount)
         self.var_calculator.set_default_discount(default_discount)
         self.default_discount = default_discount

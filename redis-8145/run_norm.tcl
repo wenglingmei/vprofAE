@@ -6,7 +6,7 @@ source cluster.tcl
 source ../instances.tcl
 source ../../support/cluster.tcl ; # Redis Cluster client.
 
-set ::instances_count 30; # How many instances we use at max.
+set ::instances_count 80; # How many instances we use at max.
 set ::tlsdir "../../tls"
 
 proc main {} {

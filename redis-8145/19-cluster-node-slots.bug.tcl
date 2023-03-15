@@ -34,9 +34,9 @@ proc cluster_create_with_continuous_slots {masters slaves} {
      unset ::__sleep__tmp__$uniq
  }
 
-set n_node 80
-set master_node 40
-set slave_node 40
+set n_node 40
+set master_node 20
+set slave_node 20
 
 test "Create a $n_node nodes cluster" {
     cluster_create_with_continuous_slots $master_node $slave_node
